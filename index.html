@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Mandelbrot</title>
+  <style>
+    body {
+      background: #111;
+      color: #fff;
+      font-family: sans-serif;
+      margin: 0;
+      padding: 0;
+      text-align: center;
+    }
+
+    #container {
+      margin: 0 auto;
+      position: relative;
+      width: 1000px;
+      height: 1000px;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 1000px;
+      height: 1000px;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="mandelbrot" width="1000" height="1000"></canvas>
+  </div>
+
+  <!-- Main Script -->
+  <script type="module">
+    /*
+      We will generate the Mandelbrot set by:
+      1) Parsing the query parameters x1,y1,x2,y2 from the URL (or default).
+      2) Spawning multiple workers (Web Workers) to split the rows among them.
+      3) Each worker does the calculation for its assigned rows and returns them.
+      4) We assemble the final image and draw it to the canvas.
+    */
+
+    // --- Parse query parameters and set defaults if none are given
+    const urlParams = new URLSearchParams(window.location.search);
+    const x1 = parseFloat(urlParams.get('x1')) || -2.5;
+    const y1 = parseFloat(urlParams.get('y1')) || -2.0;
+    const x2 = parseFloat(urlParams.get('x2')) ||  1.0;
+    const y2 = parseFloat(urlParams.get('y2')) ||  2.0;
+
+    // Canvas info
+    const canvas = document.getElementById('mandelbrot');
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;   // 1000
+    const height = canvas.height; // 1000
+
+    // You can adjust this for more/less detail
+    const maxIter = 1000;
+
+    // Number of web workers to spawn (often the number of logical CPU cores)
+    const numWorkers = navigator.hardwareConcurrency || 4;
+
+    // We'll store an ImageData into which we'll place results from workers
+    const imageData = ctx.createImageData(width, height);
+
+    // Prepare an array of workers
+    let workers = [];
+    let rowsFinished = 0;
+
+    // Function to handle messages from each worker
+    function onWorkerMessage(e) {
+      const data = e.data;
+      if (data.type === 'row') {
+        const offset = data.rowIndex * width * 4;
+        imageData.data.set(data.colors, offset);
+
+        rowsFinished++;
+        // If we've rendered all rows, draw onto the canvas
+        if (rowsFinished === height) {
+          ctx.putImageData(imageData, 0, 0);
+        }
+      }
+    }
+
+    // Create workers and set up message handlers
+    for (let i = 0; i < numWorkers; i++) {
+      const worker = new Worker(URL.createObjectURL(new Blob([`
+        onmessage = function(e) {
+          const { startRow, endRow, width, height, x1, y1, x2, y2, maxIter } = e.data;
+
+          const dx = (x2 - x1) / width;
+          const dy = (y2 - y1) / height;
+
+          for (let row = startRow; row <= endRow; row++) {
+            let rowColors = new Uint8ClampedArray(width * 4);
+            const cy = y1 + row * dy;
+            
+            for (let col = 0; col < width; col++) {
+              const cx = x1 + col * dx;
+              let zx = 0.0, zy = 0.0;
+              let iter = 0;
+
+              // Mandelbrot iteration
+              while (zx*zx + zy*zy < 4.0 && iter < maxIter) {
+                const tmp = zx*zx - zy*zy + cx;
+                zy = 2.0 * zx * zy + cy;
+                zx = tmp;
+                iter++;
+              }
+
+              // Simple coloring approach
+              const idx = col * 4;
+              if (iter === maxIter) {
+                // In the set -> black
+                rowColors[idx] = 0;
+                rowColors[idx+1] = 0;
+                rowColors[idx+2] = 0;
+                rowColors[idx+3] = 255;
+              } else {
+                // Outside the set -> color depends on iter
+                const hue = Math.floor(360 * (iter / maxIter));
+                const c = hslToRgb(hue / 360, 1.0, 0.5);
+                rowColors[idx]   = c[0];
+                rowColors[idx+1] = c[1];
+                rowColors[idx+2] = c[2];
+                rowColors[idx+3] = 255;
+              }
+            }
+
+            // Send row data back
+            postMessage({
+              type: 'row',
+              rowIndex: row,
+              colors: rowColors
+            });
+          }
+        };
+
+        // Helper: hslToRgb converts H,S,L to [R,G,B] in [0..255]
+        function hslToRgb(h, s, l){
+          if (s === 0){
+            const val = Math.round(l*255);
+            return [val, val, val];
+          }
+          const q = l < 0.5 ? l*(1+s) : l+s-l*s;
+          const p = 2*l-q;
+          const r = hue2rgb(p, q, h + 1/3);
+          const g = hue2rgb(p, q, h);
+          const b = hue2rgb(p, q, h - 1/3);
+          return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+        }
+        function hue2rgb(p, q, t){
+          if(t < 0) t += 1;
+          if(t > 1) t -= 1;
+          if(t < 1/6) return p + (q - p)*6*t;
+          if(t < 1/2) return q;
+          if(t < 2/3) return p + (q - p)*(2/3 - t)*6;
+          return p;
+        }
+      `], { type: 'application/javascript' })));
+
+      worker.onmessage = onWorkerMessage;
+      workers.push(worker);
+    }
+
+    // Distribute rows among workers
+    const rowsPerWorker = Math.ceil(height / numWorkers);
+    for (let w = 0; w < numWorkers; w++) {
+      const startRow = w * rowsPerWorker;
+      const endRow = Math.min(startRow + rowsPerWorker - 1, height - 1);
+
+      workers[w].postMessage({
+        startRow,
+        endRow,
+        width,
+        height,
+        x1,
+        y1,
+        x2,
+        y2,
+        maxIter
+      });
+    }
+  </script>
+</body>
+</html>
